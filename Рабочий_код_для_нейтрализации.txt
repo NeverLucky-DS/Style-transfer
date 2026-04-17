@@ -1,0 +1,117 @@
+# Ставим конкретную стабильную версию
+!pip uninstall -y vllm flashinfer
+!pip install -q vllm==0.6.3 sentence-transformers accelerate
+
+
+
+
+
+
+import os
+import json
+import torch
+import gc
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from sentence_transformers import SentenceTransformer, util
+from tqdm import tqdm
+
+# --- 1. ОЧИСТКА ---
+gc.collect()
+torch.cuda.empty_cache()
+
+# --- 2. НАСТРОЙКИ ---
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+INPUT_FILE = "/kaggle/input/datasets/kirillsilantev/dostoevsky/dostoevsky_blocks_for_neutralization-2.json"
+OUTPUT_FILE = "/kaggle/working/dostoevsky_parallel_final_v2.json"
+
+SYSTEM_PROMPT = (
+    "Ты — профессиональный русский редактор. Перескажи текст Достоевского "
+    "исключительно на РУССКОМ языке. Сохрани всех персонажей и факты. "
+    "Пиши сухим стилем, без архаизмов и пафоса."
+)
+
+# --- 3. ЗАГРУЗКА МОДЕЛЕЙ ---
+print("Загрузка токенизатора...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Важно для батчинга:
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left" 
+
+print("Загрузка модели Qwen на 2x T4...")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
+    device_map="auto", # Распределит слои между GPU 0 и 1
+    trust_remote_code=True
+)
+
+# Оценщик сходства (на вторую карту, чтобы разгрузить первую)
+embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', device="cuda:1")
+
+# --- 4. ЗАГРУЗКА ДАННЫХ ---
+with open(INPUT_FILE, "r", encoding="utf-8") as f:
+    dataset = json.load(f)
+
+# --- 5. ГЕНЕРАЦИЯ ---
+BATCH_SIZE = 4 # Начни с 4, если VRAM позволит — подними до 8
+results = []
+
+print(f"Старт обработки: {len(dataset)} фрагментов...")
+
+# Используем модель напрямую для лучшего контроля скорости
+model.eval()
+
+for i in range(0, len(dataset), BATCH_SIZE):
+    batch = dataset[i : i + BATCH_SIZE]
+    prompts = []
+    
+    for item in batch:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": item['original_fragment']}
+        ]
+        prompts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+    
+    # Токенизация батча
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+    
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=512, # Ограничил до 512, обычно для пересказа хватает
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    # Декодируем только новые токены (отрезаем входной промпт)
+    new_tokens = generated_ids[:, inputs.input_ids.shape[1]:]
+    generated_texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+    
+    original_texts = [item['original_fragment'] for item in batch]
+    
+    # Расчет сходства
+    emb_orig = embedder.encode(original_texts, convert_to_tensor=True, show_progress_bar=False)
+    emb_neut = embedder.encode(generated_texts, convert_to_tensor=True, show_progress_bar=False)
+    cosine_scores = util.cos_sim(emb_orig, emb_neut).diagonal().tolist()
+    
+    # Вывод и сборка
+    for j in range(len(batch)):
+        score = round(cosine_scores[j], 4)
+        print(f"[{i+j}] Score: {score} | Text: {generated_texts[j][:60]}...")
+        
+        res = batch[j]
+        res['neutral_proxy'] = generated_texts[j]
+        res['topic_fidelity'] = score
+        res['is_valid'] = score > 0.75
+        results.append(res)
+        
+    # Периодическое сохранение (чтобы не потерять данные при падении)
+    if i % (BATCH_SIZE * 5) == 0:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=4)
+
+# --- 6. ФИНАЛЬНОЕ СОХРАНЕНИЕ ---
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(results, f, ensure_ascii=False, indent=4)
+
+print(f"\nВсе готово! Итоговый файл: {OUTPUT_FILE}")
